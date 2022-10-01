@@ -1,122 +1,94 @@
 import apache_beam as beam
 from apache_beam.runners import DataflowRunner
+from apache_beam.runners import DirectRunner
 from apache_beam.options import pipeline_options
 from apache_beam.options.pipeline_options import GoogleCloudOptions
 from apache_beam.options.pipeline_options import WorkerOptions
 from apache_beam.options.pipeline_options import SetupOptions
 from apache_beam.options.pipeline_options import DebugOptions
-import google.auth
 import argparse
 import logging
 
-
-
-def create_sessions_list():
+def create_bqs_session(project_id, dataset_id, table_id):
     from google.cloud import bigquery_storage_v1
-    project_id='pod-fr-retail'
     client = bigquery_storage_v1.BigQueryReadClient()
-    table = "projects/{}/datasets/{}/tables/{}".format(
-          "pod-fr-retail", "demo", "test"
-    )
     requested_session = bigquery_storage_v1.types.ReadSession()
-    requested_session.table = table
-    requested_session.data_format = bigquery_storage_v1.types.DataFormat.AVRO
-    requested_session.read_options.selected_fields.append("orderId")
-    #requested_session.read_options.row_restriction = 'state = "WA"'
-    modifiers = None
-    parent = "projects/{}".format(project_id)
-    session = client.create_read_session(
-        parent=parent,
-        read_session=requested_session,
-        max_stream_count=30,
+    requested_session.table =  "projects/{}/datasets/{}/tables/{}".format(
+          project_id, dataset_id, table_id
     )
-
-    readers=[]
-    #print(session)
+    requested_session.data_format = bigquery_storage_v1.types.DataFormat.AVRO
+    requested_session.read_options.selected_fields = ["orderId"]
+    session = client.create_read_session(
+        parent="projects/{}".format(project_id),
+        read_session=requested_session,
+        max_stream_count=300,
+    )
+    stream_names=[]
     for stream in session.streams:
-        readers.append({'session':session,"streamName":stream.name})
-    return readers
+        stream_names.append(stream.name)
+    return  stream_names
 
-
-class bqstorage(beam.DoFn):
+class ReadBQstorage(beam.DoFn):
     def setup(self):
-        print('hello')
-    def process(self, element):
         from google.cloud import bigquery_storage_v1
-        clientbq = bigquery_storage_v1.BigQueryReadClient()
-        reader = self.clientbq.read_rows(element['streamName'])
-        rows = reader.rows(element['session'])
+        self.clientbq = bigquery_storage_v1.BigQueryReadClient()
+    def process(self, element):
+        logging.info('Stream to read: %s', element)
+        reader = self.clientbq.read_rows(element)
+        rows = reader.rows()
         for row in rows:
             yield row
 
 
 class retailAddLocalInventory(beam.DoFn):
+    def setup(self):
+        from google.cloud import retail_v2
+        self.client = retail_v2.ProductServiceClient()
+        self.LocalInventory=retail_v2.LocalInventory
+        self.PriceInfo=retail_v2.PriceInfo
+        self.AddLocalInventoriesRequest=retail_v2.AddLocalInventoriesRequest
     def process(self, element):
-        t=element
-        from googleapiclient.discovery import build
-        retail=build('retail', 'v2alpha',static_discovery= False)
-        productsCatalog = retail.projects().locations().catalogs().branches().products()
-        product='projects/486742359899/locations/global/catalogs/default_catalog/branches/0/products/16684'
-        local_inventory={
-            "localInventories": [
-                {
-                      "placeId": 'store123',
-                      "priceInfo": {
-                          "currencyCode": 'USD',
-                          "price": 1.23,
-                          "originalPrice": 1.23
-                      },
-                      "attributes":{ 
-                          "vendor": {"text": ["vendor1234", "vendor456"]}
-                          ,"lengths_cm": {"numbers":[2.3, 15.4]}
-                          , "heights_cm": {"numbers":[8.1, 6.4]} 
-                      }
-                 }
-              ]
-            ,"allowMissing": True
-            ,"addMask": "attributes.vendor"
-        }
-        productsCatalog.addLocalInventories(product=product, body=local_inventory).execute()
+        row=element
+        print(element)
+        # Initialize request argument(s)
+        request = self.AddLocalInventoriesRequest(
+            product="projects/486742359899/locations/global/catalogs/default_catalog/branches/1/products/16684",
+            local_inventories= [ 
+                self.LocalInventory( 
+                    place_id= element["orderId"]
+                    , price_info= self.PriceInfo(
+                        currency_code= 'USD',
+                        price = 1.25,
+                        original_price=1.26
+                    ))
+            ]
+        )
+        # Make the request
+        operation = self.client.add_local_inventories(request=request, timeout=200)
         yield element
 
 
 
 def run(argv=None):
-    
-    project='pod-fr-retail'
-    zone='europe-west1-c'
-    region='europe-west1'
-    worker_machine_type='n1-standard-1' #g1-small
-    num_workers=1
-    max_num_workers=1
-    temp_location = 'gs://pod-fr-retail-demo/temp'
-    staging_location='gs://pod-fr-retail-demo/staging'
-
     # Setting up the Beam pipeline options.
     options = pipeline_options.PipelineOptions()
-    #options.view_as(pipeline_options.StandardOptions).streaming = False
-    _,options.view_as(GoogleCloudOptions).project = google.auth.default()
-    options.view_as(GoogleCloudOptions).region = region
-    options.view_as(GoogleCloudOptions).staging_location = staging_location
-    options.view_as(GoogleCloudOptions).temp_location = temp_location
-    options.view_as(WorkerOptions).worker_zone = zone
-    options.view_as(WorkerOptions).machine_type = worker_machine_type
-    options.view_as(WorkerOptions).num_workers = num_workers
-    #options.view_as(WorkerOptions).max_num_workers = max_num_workers
-    options.view_as(WorkerOptions).autoscaling_algorithm='NONE'
+    #options.view_as(GoogleCloudOptions).job_name = 'read-bq-test'
+    options.view_as(GoogleCloudOptions).project = 'pod-fr-retail'
+    options.view_as(GoogleCloudOptions).region = 'europe-west1'
+    options.view_as(GoogleCloudOptions).staging_location = 'gs://pod-fr-retail/bqdataflow/staging'
+    options.view_as(GoogleCloudOptions).temp_location = 'gs://pod-fr-retail/bqdataflow/temp'
+    #options.view_as(WorkerOptions).max_num_workers = 30
     options.view_as(SetupOptions).requirements_file='requirements.txt'
-    #options.view_as(SetupOptions).save_main_session = True
-    #options.view_as(DebugOptions).experiments = ['shuffle_mode=service,use_runner_v2']
-    #options.view_as(SetupOptions).requirements_cache='/root/notebook/workspace/20200617'
-
+    #options.view_as(DebugOptions).experiments = ["no_use_multiple_sdk_containers"]
+    sessions = create_bqs_session('pod-fr-retail', 'demo', 'test')
     with beam.Pipeline(DataflowRunner(),options=options) as p:
         (p
-         | "Create " >> beam.Create(create_sessions_list())
-         | "Read orderId" >> beam.ParDo(bqstorage())
-         | "Add or update Local inventory" >>  beam.ParDo(retailAddLocalInventory())
-         #| ksdlk
+         | "Create " >> beam.Create(sessions, reshuffle=True)
+         | "Read orderId" >> beam.ParDo(ReadBQstorage())
+         | "Add Local inventories orderId" >> beam.ParDo(retailAddLocalInventory())
         )
-        
+
+
 if __name__ == '__main__':
     logging.getLogger().setLevel(logging.INFO)
     run()

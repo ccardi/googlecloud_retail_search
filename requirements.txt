@@ -1,0 +1,2 @@
+google-cloud-retail
+google-cloud-bigquery-storage
