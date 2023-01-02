@@ -1,1 +1,0 @@
-gs://pod-fr-retail-kaggle/train-images/2500000/1000010547-8309749-0.jpg,1000010547-8309749-0,kaggle_s
